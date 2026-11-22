@@ -20,6 +20,6 @@ jobs:
       - name: Register the notebook kernel
         run: python -m ipykernel install --user --name python3
       - name: Unit tests
-        run: pytest -q
+        run: python -m pytest -q
       - name: Execute CPU notebooks
         run: python scripts/execute_notebooks.py --timeout 240
