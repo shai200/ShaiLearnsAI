@@ -1,0 +1,23 @@
+# Python / virtualenvs
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Caches (HF downloads, tokenizer/model caches, TransformerLens, etc.)
+.cache/
+hf_cache/
+.huggingface/
+wandb/
+runs/
+
+# Generated artifacts: checkpoints, adapters, executed notebooks, logs
+outputs/*
+!outputs/execution_report.md
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.ckpt
+*.log
