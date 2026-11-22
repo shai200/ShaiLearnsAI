@@ -1,0 +1,21 @@
+# Install a CPU build of PyTorch first, then this file:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements.txt
+# A normal `pip install torch` also works. It may download a larger wheel.
+numpy>=1.26
+scipy>=1.11
+pandas>=2.1
+scikit-learn>=1.4
+matplotlib>=3.8
+jupyter>=1.0
+nbclient>=0.10
+ipykernel>=6.29
+nbformat>=5.10
+torch>=2.2
+transformers>=4.40
+peft>=0.11
+opencv-python-headless>=4.9
+umap-learn>=0.5
+chromadb>=0.5
+qdrant-client>=1.9
+pytest>=8.0
