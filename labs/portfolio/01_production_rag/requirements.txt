@@ -1,0 +1,7 @@
+# Packages this notebook imports directly.
+# Install the repository requirements.txt to run the full suite and CI.
+numpy
+pandas
+scikit-learn
+chromadb
+qdrant-client
