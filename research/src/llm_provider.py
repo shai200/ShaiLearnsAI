@@ -15,17 +15,26 @@ Backend selection
 4. otherwise the **local Hugging Face** fallback (the default; free, offline
    after the first download, runs on CPU).
 
-If a remote backend is requested but its key or SDK is missing -- or a remote
-call fails at runtime -- the provider prints a warning and transparently falls
-back to the local HF model. A notebook never fails just because no API key is
-configured.
+If a remote backend is requested but its key or SDK is missing, or the client
+cannot be constructed, the provider warns and uses the local HF model. If a
+remote call fails at runtime (network, auth, quota, retired model name ...),
+the provider warns once and switches to the local HF model **for the rest of
+the session**, so one notebook run is never a silent mix of two models. A
+notebook never fails just because no API key is configured.
 
 Model overrides
 ---------------
-LAB_HF_MODEL          default "HuggingFaceTB/SmolLM2-135M-Instruct" (~540 MB fp32, Apache-2.0).
-                      For an ultra-light smoke test use "sshleifer/tiny-gpt2" (outputs gibberish).
+LAB_HF_MODEL          default "HuggingFaceTB/SmolLM2-135M-Instruct" (Apache-2.0; ~270 MB download,
+                      ~540 MB in RAM, because it is loaded as float32 on CPU). For an ultra-light smoke test you can use
+                      "sshleifer/tiny-gpt2" (outputs gibberish; its model card states no license,
+                      see THIRD_PARTY_NOTICES.md).
 LAB_OPENAI_MODEL      default "gpt-4o-mini"
 LAB_ANTHROPIC_MODEL   default "claude-opus-5-5"
+LAB_ANTHROPIC_FALLBACKS=0   do not ask the Anthropic API to re-run a request on a fallback
+                      model when a safety classifier declines it (default: ask, see below).
+
+API keys are read from the environment by the SDKs (``OPENAI_API_KEY``,
+``ANTHROPIC_API_KEY``); this module never stores, prints or logs them.
 
 The remote SDKs (``openai``, ``anthropic``) are optional dependencies and are
 only imported when that backend is actually used.
@@ -35,6 +44,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import warnings
 from abc import ABC, abstractmethod
 from typing import Sequence
@@ -77,7 +87,11 @@ class HFProvider(LLMProvider):
         self.model_name = model_name or os.environ.get("LAB_HF_MODEL", DEFAULT_HF_MODEL)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(self.model_name).to(self.device)
+        # On CPU, load in float32. Many Hub checkpoints (SmolLM2 included) are stored in bfloat16 and transformers
+        # keeps that dtype by default; on CPU that is several times slower and coarse enough to change outputs
+        # from run to run.
+        dtype_kw = {"dtype": torch.float32} if self.device == "cpu" else {}
+        self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **dtype_kw).to(self.device)
         self.model.eval()
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -143,14 +157,33 @@ class OpenAIProvider(LLMProvider):
         self.client = OpenAI()  # reads OPENAI_API_KEY
         self.model = model or os.environ.get("LAB_OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
         self.name = f"openai:{self.model}"
+        self._legacy_params = True  # send max_tokens/temperature until the API says otherwise
 
     def complete(self, prompt, system=None, max_tokens=256, temperature=0.0) -> str:
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
+        if not self._legacy_params:
+            return self._complete_reasoning_style(messages, max_tokens)
+        from openai import BadRequestError
+
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.model, messages=messages, max_tokens=max_tokens, temperature=temperature
+            )
+        except BadRequestError:
+            # Newer OpenAI models reject `max_tokens` / non-default `temperature`.
+            # Retry once with the newer parameter names and remember the outcome.
+            text = self._complete_reasoning_style(messages, max_tokens)
+            self._legacy_params = False
+            return text
+        return (resp.choices[0].message.content or "").strip()
+
+    def _complete_reasoning_style(self, messages, max_tokens) -> str:
+        # Reasoning tokens count against max_completion_tokens, so leave headroom.
         resp = self.client.chat.completions.create(
-            model=self.model, messages=messages, max_tokens=max_tokens, temperature=temperature
+            model=self.model, messages=messages, max_completion_tokens=max(int(max_tokens), 2048)
         )
         return (resp.choices[0].message.content or "").strip()
 
@@ -162,23 +195,46 @@ class AnthropicProvider(LLMProvider):
         self.client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY
         self.model = model or os.environ.get("LAB_ANTHROPIC_MODEL", DEFAULT_ANTHROPIC_MODEL)
         self.name = f"anthropic:{self.model}"
+        # Server-side refusal fallback (beta): if a safety classifier declines a
+        # request, the API re-runs it on a fallback model inside the same call.
+        # Notebook 06 sends (mild) red-team prompts, so this is on by default for
+        # the models that support it. LAB_ANTHROPIC_FALLBACKS=0 turns it off.
+        self._use_fallbacks = (
+            os.environ.get("LAB_ANTHROPIC_FALLBACKS", "1").strip().lower() not in {"0", "false", "no", "off"}
+            and self.model.startswith(self._FALLBACK_MODELS)
+        )
+
+    _FALLBACK_BETA = "server-side-fallback-2026-07-01"
+    _FALLBACK_MODELS = ("claude-opus-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-fable-5-2")
 
     def complete(self, prompt, system=None, max_tokens=256, temperature=0.0) -> str:
-        # Current Claude models think adaptively and do not accept sampling
-        # parameters, so `temperature` is intentionally not forwarded. We ask for
-        # low effort (these are short lab prompts) and leave headroom in
-        # max_tokens so thinking never starves the visible answer.
+        # Current Claude models think adaptively and reject sampling parameters,
+        # so `temperature` is intentionally not forwarded. We ask for low effort
+        # (these are short lab prompts). `max_tokens` is a ceiling on thinking +
+        # answer, so we leave headroom: the caller's value bounds the answer only
+        # loosely here (ask for brevity in the prompt if you need it).
+        import anthropic
+
         kwargs = dict(
             model=self.model,
-            max_tokens=max(int(max_tokens), 1024),
+            max_tokens=max(int(max_tokens), 2048),
             messages=[{"role": "user", "content": prompt}],
             output_config={"effort": "low"},
         )
         if system:
             kwargs["system"] = system
-        resp = self.client.messages.create(**kwargs)
+        resp = None
+        if self._use_fallbacks:
+            try:
+                resp = self.client.beta.messages.create(betas=[self._FALLBACK_BETA], fallbacks="default", **kwargs)
+            except (anthropic.BadRequestError, TypeError, AttributeError):
+                # Model, platform or SDK version without server-side fallbacks:
+                # use the plain request from now on.
+                self._use_fallbacks = False
+        if resp is None:
+            resp = self.client.messages.create(**kwargs)
         if resp.stop_reason == "refusal":
-            return "[refused by the model's safety classifier]"
+            return "[declined by the model's safety classifier]"
         return "".join(b.text for b in resp.content if b.type == "text").strip()
 
 
@@ -186,7 +242,9 @@ class AnthropicProvider(LLMProvider):
 # Fallback wrapper + factory
 # --------------------------------------------------------------------------- #
 class FallbackProvider(LLMProvider):
-    """Wraps a remote provider; on any runtime error, warns once and uses HF."""
+    """Wraps a remote provider. On the first runtime error it warns once and
+    switches to the local HF model for the rest of the session (``.name``
+    changes too, so notebooks can report which model actually answered)."""
 
     def __init__(self, primary: LLMProvider):
         self.primary = primary
@@ -194,18 +252,30 @@ class FallbackProvider(LLMProvider):
         self.name = primary.name
 
     @property
+    def using_fallback(self) -> bool:
+        return self._fallback is not None
+
+    @property
     def fallback(self) -> HFProvider:
         if self._fallback is None:
-            self._fallback = HFProvider()
+            cached = _CACHE.get("hf")
+            self._fallback = cached if isinstance(cached, HFProvider) else HFProvider()
         return self._fallback
 
     def complete(self, prompt, system=None, max_tokens=256, temperature=0.0) -> str:
-        try:
-            return self.primary.complete(prompt, system, max_tokens, temperature)
-        except Exception as exc:  # network, auth, quota ...
-            warnings.warn(f"{self.primary.name} failed ({exc!r}); falling back to local HF model.")
-            self.name = self.fallback.name
-            return self.fallback.complete(prompt, system, max_tokens, temperature)
+        if not self.using_fallback:
+            try:
+                return self.primary.complete(prompt, system, max_tokens, temperature)
+            except Exception as exc:  # network, auth, quota, unknown model ...
+                # Report only the exception type and HTTP status. Provider error *messages* can echo
+                # part of the API key (OpenAI's 401 does), and notebook outputs get shared.
+                status = getattr(exc, "status_code", None)
+                detail = type(exc).__name__ + (f", HTTP {status}" if status else "")
+                warnings.warn(
+                    f"{self.primary.name} failed ({detail}); using the local HF model for the rest of this session."
+                )
+                self.name = self.fallback.name
+        return self.fallback.complete(prompt, system, max_tokens, temperature)
 
 
 _CACHE: dict[str, LLMProvider] = {}
@@ -221,6 +291,9 @@ def _try_remote(kind: str) -> LLMProvider | None:
         return FallbackProvider(cls())
     except ImportError:
         warnings.warn(f"The `{kind}` Python package is not installed (pip install {kind}); using local HF model.")
+        return None
+    except Exception as exc:  # e.g. a malformed key or base-URL setting rejected by the SDK constructor
+        warnings.warn(f"Could not create the {kind} client ({type(exc).__name__}); using local HF model.")
         return None
 
 
@@ -270,7 +343,7 @@ def choose(
     letters = [chr(ord("A") + i) for i in range(len(options))]
     body = question.strip() + "\n\n" + "\n".join(f"({l}) {o}" for l, o in zip(letters, options))
     body += "\n\nAnswer with the letter of the best option."
-    base = provider.fallback if isinstance(provider, FallbackProvider) and provider._fallback else provider
+    base = provider.fallback if isinstance(provider, FallbackProvider) and provider.using_fallback else provider
     if isinstance(base, HFProvider):
         scores = [base.continuation_logprob(body, f"The answer is ({l})", system) for l in letters]
         m = max(scores)
@@ -279,7 +352,15 @@ def choose(
         probs = [e / z for e in exps]
         return int(max(range(len(probs)), key=probs.__getitem__)), probs
     reply = provider.complete(body, system=system, max_tokens=8).upper()
-    idx = next((i for i, l in enumerate(letters) if f"({l})" in reply or reply.strip().startswith(l)), 0)
+    if isinstance(provider, FallbackProvider) and provider.using_fallback:
+        return choose(provider, question, options, system)   # the remote call just failed over: score with log-probs
+    valid = "".join(letters)
+    # Prefer an explicit "(B)"; otherwise a stand-alone letter ("B", "Answer: B"). A bare
+    # startswith() test would read "ANSWER: (B)" as a vote for A.
+    m = re.search(rf"\(([{valid}])\)", reply) or re.search(rf"\b([{valid}])\b", reply)
+    if m is None:     # unparseable reply: report "no preference" rather than silently voting for (A)
+        return 0, [1.0 / len(options)] * len(options)
+    idx = letters.index(m.group(1))
     return idx, [1.0 if i == idx else 0.0 for i in range(len(options))]
 
 

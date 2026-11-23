@@ -1,9 +1,15 @@
 """A compact nanoGPT-style decoder-only transformer + training helpers.
 
-Adapted from Andrej Karpathy's nanoGPT (MIT License,
-https://github.com/karpathy/nanoGPT, model.py / train.py), condensed for
+Adapted from Andrej Karpathy's nanoGPT (https://github.com/karpathy/nanoGPT,
+model.py / train.py; MIT License, Copyright (c) 2022 Andrej Karpathy -- the
+full notice is reproduced in research/THIRD_PARTY_NOTICES.md), condensed for
 teaching and for CPU-sized experiments. Notebook 02 walks through this
 architecture step by step; notebook 03 imports it to run a scaling sweep.
+
+Differences from nanoGPT worth knowing about: evaluation at chosen steps
+(``eval_at``), an optional constant-LR schedule, AdamW beta2 = 0.95 by default
+(nanoGPT's shakespeare_char config uses 0.99), and ``num_params()`` excludes
+both embedding tables by default.
 """
 
 from __future__ import annotations
