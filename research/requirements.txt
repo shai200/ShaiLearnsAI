@@ -1,0 +1,37 @@
+# Training LLMs & Frontier Research track: CPU-friendly dependencies.
+# Tested with Python 3.13 (see outputs/execution_report.md for the exact run).
+#
+# Install CPU-only PyTorch first to avoid pulling multi-GB CUDA wheels:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# then:
+#   pip install -r requirements.txt
+
+torch>=2.5                     # CPU wheel recommended (see above); tested 2.15.0+cpu
+numpy>=2.0,<3
+scipy>=1.13                    # tested 1.18.1 (power-law fits in notebook 03)
+pandas>=2.2                    # tested 3.1.1
+matplotlib>=3.9                # tested 3.11.2
+regex>=2024.0                  # Unicode-class regexes for the BPE pre-tokenizer (notebook 01)
+
+# Hugging Face stack (Apache-2.0)
+transformers>=5.0,<6           # tested 5.24.0
+datasets>=3.0                  # tested 5.2.0
+accelerate>=1.0                # tested 1.16.0
+peft>=0.17                     # tested 0.22.0
+trl>=1.0,<2                    # tested 1.18.2 (SFTTrainer / RewardTrainer / DPOTrainer)
+huggingface_hub>=1.0           # tested 2.4.0
+
+# Mechanistic interpretability (MIT)
+transformer-lens>=4.0,<5       # tested 4.4.0 (TransformerBridge API; notebooks 07-08)
+
+# Notebook tooling
+jupyterlab>=4.0
+ipykernel>=6.29
+nbformat>=5.10
+nbclient>=0.10                 # used by scripts/run_all_notebooks.py
+
+# Optional: remote LLM backends for notebook 06 (only used if an API key is set).
+# Checked with openai 3.57.0 and anthropic 2.12.0 using invalid keys and stubbed clients
+# (fallback behaviour and request shape); no paid API call was made.
+# openai>=1.0
+# anthropic>=1.0
